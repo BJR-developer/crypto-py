@@ -1,17 +1,18 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
-import google.generativeai as genai
 from pycoingecko import CoinGeckoAPI
-from langchain.prompts.prompt import PromptTemplate
+from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Dict, Any
+import json
+import re
 
 # Load environment variables
 load_dotenv()
@@ -23,39 +24,76 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Initialize CoinGecko API client
 cg = CoinGeckoAPI()
 
-# Initialize Google Generative AI
-GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GOOGLE_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable is not set")
+# Initialize OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
 
-genai.configure(api_key=GOOGLE_API_KEY)
-model = ChatGoogleGenerativeAI(
-    model="gemini-pro",
-    temperature=0,
-    google_api_key=GOOGLE_API_KEY
-)
+def get_ai_model():
+    """Get the OpenAI model instance"""
+    return ChatOpenAI(
+        model="gpt-3.5-turbo",
+        temperature=0,
+        openai_api_key=OPENAI_API_KEY
+    )
+
+def get_market_sentiment_prompt(market_data: Dict[str, Any], technical_indicators: Dict[str, float]) -> str:
+    """Generate prompt for AI analysis based on market data"""
+    return f"""You are a professional cryptocurrency analyst. Analyze the following market data and provide a trading signal response in a specific JSON format.
+
+Market Data:
+- Current Price: ${market_data['current_price']['usd']}
+- 24h Price Change: {market_data['price_change_percentage_24h']}%
+- Market Cap: ${market_data['market_cap']['usd']}
+- 24h Trading Volume: ${market_data['total_volume']['usd']}
+
+Technical Indicators:
+- RSI (14): {technical_indicators['rsi']:.2f}
+- MACD: {technical_indicators['macd']:.2f}
+- Signal Line: {technical_indicators['signal_line']:.2f}
+
+Provide your analysis in the following JSON format:
+{{
+    "signal": "BULLISH or BEARISH",
+    "confidence": "number between 0.0 and 1.0",
+    "target": "next price target in USD (number only)",
+    "stop_loss": "recommended stop loss level in USD (number only)",
+    "analysis": "2-3 sentences explaining the rationale"
+}}
+
+Ensure your response is ONLY the JSON object, with no additional text before or after."""
 
 class CryptoRequest(BaseModel):
-    coin_id: str
-    days: Optional[int] = 30
+    coin_id: str = Field(..., description="The ID of the cryptocurrency (e.g., 'bitcoin')")
+    days: Optional[int] = Field(default=30, description="Number of days of historical data to analyze")
 
 class CryptoSignal(BaseModel):
-    coin_id: str
-    signal: str
-    confidence: float
-    current_price: float
-    price_change_24h: float
-    rsi_value: float
-    macd_signal: str
-    analysis: str
-    next_target: float
-    stop_loss: float
+    coin_id: str = Field(..., description="The ID of the cryptocurrency")
+    signal: str = Field(..., description="The trading signal (BULLISH or BEARISH)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="The confidence level of the signal (0.0-1.0)")
+    current_price: float = Field(..., gt=0, description="The current price of the cryptocurrency")
+    price_change_24h: float = Field(..., description="The 24h price change percentage")
+    rsi_value: float = Field(..., ge=0, le=100, description="The RSI value (0-100)")
+    macd_signal: str = Field(..., description="The MACD signal (BULLISH or BEARISH)")
+    analysis: str = Field(..., min_length=10, description="The detailed market analysis")
+    next_target: float = Field(..., gt=0, description="The next price target")
+    stop_loss: float = Field(..., gt=0, description="The recommended stop loss level")
 
 def calculate_technical_indicators(prices):
-    df = pd.DataFrame(prices)
+    """Calculate technical indicators from price data"""
+    df = pd.DataFrame(prices, columns=['timestamp', 'price'])
     
     # Calculate RSI
     delta = df['price'].diff()
@@ -71,41 +109,10 @@ def calculate_technical_indicators(prices):
     signal_line = macd.ewm(span=9, adjust=False).mean()
     
     return {
-        'rsi': rsi.iloc[-1],
-        'macd': macd.iloc[-1],
-        'signal_line': signal_line.iloc[-1]
+        'rsi': float(rsi.iloc[-1]),
+        'macd': float(macd.iloc[-1]),
+        'signal_line': float(signal_line.iloc[-1])
     }
-
-def get_market_sentiment_prompt(market_data, technical_indicators):
-    return f"""
-    Analyze the following cryptocurrency data and provide a trading signal:
-    
-    Technical Indicators:
-    - RSI: {technical_indicators['rsi']:.2f}
-    - MACD: {technical_indicators['macd']:.2f}
-    - Signal Line: {technical_indicators['signal_line']:.2f}
-    
-    Market Data:
-    - Current Price: ${market_data['current_price']['usd']}
-    - 24h Change: {market_data['price_change_percentage_24h']}%
-    - 7d Change: {market_data['price_change_percentage_7d']}%
-    - Market Cap: ${market_data['market_cap']['usd']}
-    - Volume: ${market_data['total_volume']['usd']}
-    
-    Based on this data:
-    1. Determine if the signal is BULLISH or BEARISH
-    2. Provide a confidence score between 0 and 1
-    3. Suggest a reasonable next price target
-    4. Recommend a stop-loss level
-    5. Give a brief analysis explaining the signal
-    
-    Format your response exactly like this example:
-    SIGNAL: BULLISH
-    CONFIDENCE: 0.85
-    TARGET: 45000
-    STOP_LOSS: 38000
-    ANALYSIS: The asset shows strong bullish momentum with RSI...
-    """
 
 @app.get("/")
 async def root():
@@ -115,28 +122,25 @@ async def root():
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-@app.get("/trading_signal/{coin_id}")
+@app.get("/trading_signal/{coin_id}", response_model=CryptoSignal)
 async def get_trading_signal(coin_id: str, days: int = 30):
     try:
-        # Fetch historical price data
-        try:
-            price_data = cg.get_coin_market_chart_by_id(id=coin_id, vs_currency='usd', days=days)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error fetching price data from CoinGecko: {str(e)}"
-            )
+        # Normalize coin_id
+        coin_id = coin_id.lower().strip()
+        
+        # Common mappings for popular coins
+        coin_mappings = {
+            "ripple": "xrp",
+            "btc": "bitcoin",
+            "eth": "ethereum",
+            "doge": "dogecoin"
+        }
+        
+        # Use mapping if available
+        coin_id = coin_mappings.get(coin_id, coin_id)
         
         try:
-            prices_df = pd.DataFrame(price_data['prices'], columns=['timestamp', 'price'])
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error processing price data: {str(e)}"
-            )
-        
-        # Get current market data
-        try:
+            # Get market data
             coin_data = cg.get_coin_by_id(
                 id=coin_id,
                 localization=False,
@@ -147,16 +151,35 @@ async def get_trading_signal(coin_id: str, days: int = 30):
                 sparkline=False
             )
         except Exception as e:
+            if "could not find coin with the given id" in str(e).lower():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Cryptocurrency '{coin_id}' not found. Please check the coin ID and try again."
+                )
             raise HTTPException(
                 status_code=500,
-                detail=f"Error fetching coin data from CoinGecko: {str(e)}"
+                detail=f"Error fetching market data: {str(e)}"
             )
         
         market_data = coin_data['market_data']
         
+        # Get historical price data
+        try:
+            price_data = cg.get_coin_market_chart_by_id(
+                id=coin_id,
+                vs_currency='usd',
+                days=str(days)
+            )
+            prices = price_data['prices']
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error fetching historical price data: {str(e)}"
+            )
+        
         # Calculate technical indicators
         try:
-            technical_indicators = calculate_technical_indicators(prices_df)
+            technical_indicators = calculate_technical_indicators(prices)
         except Exception as e:
             raise HTTPException(
                 status_code=500,
@@ -164,46 +187,48 @@ async def get_trading_signal(coin_id: str, days: int = 30):
             )
         
         # Create analysis prompt
-        sentiment_prompt = PromptTemplate(
-            input_variables=["data"],
-            template="Analyze this cryptocurrency data and provide trading signals: {data}"
-        )
-        
-        # Create chain and get analysis
         try:
-            sentiment_chain = LLMChain(llm=model, prompt=sentiment_prompt)
-            analysis_result = sentiment_chain.run(data=get_market_sentiment_prompt(market_data, technical_indicators))
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error generating AI analysis: {str(e)}"
+            model = get_ai_model()
+            prompt = PromptTemplate(
+                input_variables=["market_data"],
+                template="{market_data}"
             )
-        
-        # Parse AI response
-        try:
-            lines = analysis_result.strip().split('\n')
-            signal_data = {}
-            for line in lines:
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    signal_data[key.strip()] = value.strip()
+            
+            # Create chain and get analysis
+            sentiment_chain = LLMChain(llm=model, prompt=prompt)
+            analysis_result = sentiment_chain.run(market_data=get_market_sentiment_prompt(market_data, technical_indicators))
+            
+            # Parse the analysis result
+            try:
+                analysis_result = json.loads(analysis_result)
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON response from AI model")
+            
+            if not all(key in analysis_result for key in ['signal', 'confidence', 'target', 'stop_loss', 'analysis']):
+                raise ValueError("Invalid response from AI model. Missing required keys.")
             
             return CryptoSignal(
                 coin_id=coin_id,
-                signal=signal_data.get('SIGNAL', 'NEUTRAL'),
-                confidence=float(signal_data.get('CONFIDENCE', '0.5')),
+                signal=analysis_result['signal'].upper(),
+                confidence=analysis_result['confidence'],
                 current_price=market_data['current_price']['usd'],
                 price_change_24h=market_data['price_change_percentage_24h'],
                 rsi_value=technical_indicators['rsi'],
                 macd_signal="BULLISH" if technical_indicators['macd'] > technical_indicators['signal_line'] else "BEARISH",
-                analysis=signal_data.get('ANALYSIS', 'No analysis available'),
-                next_target=float(signal_data.get('TARGET', market_data['current_price']['usd'])),
-                stop_loss=float(signal_data.get('STOP_LOSS', market_data['current_price']['usd'] * 0.95))
+                analysis=analysis_result['analysis'],
+                next_target=analysis_result['target'],
+                stop_loss=analysis_result['stop_loss']
+            )
+            
+        except ValueError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error parsing AI response: {str(e)}"
             )
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Error parsing analysis results: {str(e)}"
+                detail=f"Error generating AI analysis: {str(e)}"
             )
             
     except HTTPException:
@@ -216,20 +241,25 @@ async def get_trading_signal(coin_id: str, days: int = 30):
 
 @app.get("/supported_coins")
 async def get_supported_coins():
+    """Get a list of supported cryptocurrencies"""
     try:
         coins_list = cg.get_coins_list()
-        return {"supported_coins": coins_list}
+        # Return only the most relevant information
+        return {
+            "supported_coins": [
+                {
+                    "id": coin["id"],
+                    "symbol": coin["symbol"],
+                    "name": coin["name"]
+                }
+                for coin in coins_list
+            ]
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-app = CORSMiddleware(
-    app=app,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    max_age=3600,
-)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching supported coins: {str(e)}"
+        )
 
 if __name__ == "__main__" and not os.getenv("VERCEL"):
     import uvicorn
