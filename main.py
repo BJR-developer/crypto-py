@@ -44,7 +44,7 @@ if not OPENAI_API_KEY:
 def get_ai_model():
     """Get the OpenAI model instance"""
     return ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         temperature=0,
         openai_api_key=OPENAI_API_KEY
     )
@@ -130,7 +130,7 @@ async def get_trading_signal(coin_id: str, days: int = 30):
         
         # Common mappings for popular coins
         coin_mappings = {
-            "ripple": "xrp",
+            "xrp": "ripple",
             "btc": "bitcoin",
             "eth": "ethereum",
             "doge": "dogecoin"
