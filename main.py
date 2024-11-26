@@ -44,7 +44,7 @@ if not OPENAI_API_KEY:
 def get_ai_model():
     """Get the OpenAI model instance"""
     return ChatOpenAI(
-        model="gpt-4o-mini",
+        model="gpt-4-turbo-preview",
         temperature=0,
         openai_api_key=OPENAI_API_KEY
     )
@@ -90,6 +90,31 @@ class CryptoSignal(BaseModel):
     analysis: str = Field(..., min_length=10, description="The detailed market analysis")
     next_target: float = Field(..., gt=0, description="The next price target")
     stop_loss: float = Field(..., gt=0, description="The recommended stop loss level")
+
+class TopCoin(BaseModel):
+    coin_id: str = Field(..., description="The ID of the cryptocurrency")
+    name: str = Field(..., description="The name of the cryptocurrency")
+    current_price: float = Field(..., gt=0, description="Current price in USD")
+    price_change_24h: float = Field(..., description="24h price change percentage")
+    volume_24h: float = Field(..., gt=0, description="24h trading volume")
+    market_cap: float = Field(..., gt=0, description="Market capitalization")
+    confidence_score: float = Field(..., ge=0.0, le=1.0, description="AI confidence score")
+    analysis: str = Field(..., min_length=10, description="Trading analysis and rationale")
+    target_price: float = Field(..., gt=0, description="Target price prediction")
+    stop_loss: float = Field(..., gt=0, description="Recommended stop loss")
+
+class GridTradingCoin(BaseModel):
+    coin_id: str = Field(..., description="The ID of the cryptocurrency")
+    name: str = Field(..., description="The name of the cryptocurrency")
+    current_price: float = Field(..., gt=0, description="Current price in USD")
+    volatility_24h: float = Field(..., description="24h price volatility")
+    volume_24h: float = Field(..., gt=0, description="24h trading volume")
+    market_cap: float = Field(..., gt=0, description="Market capitalization")
+    grid_score: float = Field(..., ge=0.0, le=1.0, description="Suitability score for grid trading")
+    analysis: str = Field(..., min_length=10, description="Analysis of suitability for grid trading")
+    upper_price: float = Field(..., gt=0, description="Recommended upper grid price")
+    lower_price: float = Field(..., gt=0, description="Recommended lower grid price")
+    grid_levels: int = Field(..., ge=3, le=100, description="Recommended number of grid levels")
 
 def calculate_technical_indicators(prices):
     """Calculate technical indicators from price data"""
@@ -259,6 +284,248 @@ async def get_supported_coins():
         raise HTTPException(
             status_code=500,
             detail=f"Error fetching supported coins: {str(e)}"
+        )
+
+@app.get("/best_bearish_coins", response_model=list[TopCoin])
+async def get_best_bearish_coins():
+    """Find the top 3 coins with strongest bearish signals"""
+    try:
+        # Get top 100 coins by market cap
+        markets = cg.get_coins_markets(
+            vs_currency='usd',
+            order='market_cap_desc',
+            per_page=100,
+            sparkline=False
+        )
+        
+        # Filter for coins with negative price change
+        bearish_coins = [
+            coin for coin in markets 
+            if coin['price_change_24h'] is not None and coin['price_change_24h'] < 0
+        ]
+        
+        # Sort by price change (most negative first)
+        bearish_coins.sort(key=lambda x: x['price_change_24h'])
+        
+        # Analyze top 5 most bearish coins
+        results = []
+        for coin in bearish_coins[:5]:
+            try:
+                # Get technical indicators
+                price_data = cg.get_coin_market_chart_by_id(
+                    id=coin['id'],
+                    vs_currency='usd',
+                    days='1'
+                )
+                technical_indicators = calculate_technical_indicators(price_data['prices'])
+                
+                # Get AI analysis
+                model = get_ai_model()
+                prompt = PromptTemplate(
+                    input_variables=["market_data"],
+                    template="{market_data}"
+                )
+                
+                sentiment_chain = LLMChain(llm=model, prompt=prompt)
+                analysis_result = sentiment_chain.run(
+                    market_data=get_market_sentiment_prompt(coin, technical_indicators)
+                )
+                
+                analysis_json = json.loads(analysis_result)
+                
+                if analysis_json['signal'] == 'BEARISH':
+                    results.append(TopCoin(
+                        coin_id=coin['id'],
+                        name=coin['name'],
+                        current_price=coin['current_price'],
+                        price_change_24h=coin['price_change_24h'],
+                        volume_24h=coin['total_volume'],
+                        market_cap=coin['market_cap'],
+                        confidence_score=analysis_json['confidence'],
+                        analysis=analysis_json['analysis'],
+                        target_price=analysis_json['target'],
+                        stop_loss=analysis_json['stop_loss']
+                    ))
+                
+                if len(results) >= 3:
+                    break
+                    
+            except Exception as e:
+                continue
+        
+        # Sort by confidence score
+        results.sort(key=lambda x: x.confidence_score, reverse=True)
+        return results[:3]
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error finding bearish coins: {str(e)}"
+        )
+
+@app.get("/best_bullish_coins", response_model=list[TopCoin])
+async def get_best_bullish_coins():
+    """Find the top 3 coins with potential bullish reversal in next 24 hours"""
+    try:
+        # Get top 100 coins by market cap
+        markets = cg.get_coins_markets(
+            vs_currency='usd',
+            order='volume_desc',  # Sort by volume for potential momentum
+            per_page=100,
+            sparkline=False
+        )
+        
+        # Filter for coins with high volume but price near support
+        potential_coins = []
+        for coin in markets:
+            if coin['total_volume'] > 0:  # Ensure there's trading activity
+                try:
+                    # Get technical indicators
+                    price_data = cg.get_coin_market_chart_by_id(
+                        id=coin['id'],
+                        vs_currency='usd',
+                        days='1'
+                    )
+                    technical_indicators = calculate_technical_indicators(price_data['prices'])
+                    
+                    # Look for oversold conditions (RSI < 30)
+                    if technical_indicators['rsi'] < 30:
+                        potential_coins.append((coin, technical_indicators))
+                        
+                except Exception:
+                    continue
+                    
+                if len(potential_coins) >= 5:
+                    break
+        
+        # Analyze potential bullish coins
+        results = []
+        for coin, indicators in potential_coins:
+            try:
+                # Get AI analysis
+                model = get_ai_model()
+                prompt = PromptTemplate(
+                    input_variables=["market_data"],
+                    template="{market_data}"
+                )
+                
+                sentiment_chain = LLMChain(llm=model, prompt=prompt)
+                analysis_result = sentiment_chain.run(
+                    market_data=get_market_sentiment_prompt(coin, indicators)
+                )
+                
+                analysis_json = json.loads(analysis_result)
+                
+                if analysis_json['signal'] == 'BULLISH':
+                    results.append(TopCoin(
+                        coin_id=coin['id'],
+                        name=coin['name'],
+                        current_price=coin['current_price'],
+                        price_change_24h=coin['price_change_24h'],
+                        volume_24h=coin['total_volume'],
+                        market_cap=coin['market_cap'],
+                        confidence_score=analysis_json['confidence'],
+                        analysis=analysis_json['analysis'],
+                        target_price=analysis_json['target'],
+                        stop_loss=analysis_json['stop_loss']
+                    ))
+                
+            except Exception:
+                continue
+                
+            if len(results) >= 3:
+                break
+        
+        # Sort by confidence score
+        results.sort(key=lambda x: x.confidence_score, reverse=True)
+        return results[:3]
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error finding bullish coins: {str(e)}"
+        )
+
+@app.get("/best_grid_trading_coins", response_model=list[GridTradingCoin])
+async def get_best_grid_trading_coins():
+    """Find the top 3 stable coins suitable for grid trading"""
+    try:
+        # Get top 100 coins by market cap
+        markets = cg.get_coins_markets(
+            vs_currency='usd',
+            order='market_cap_desc',
+            per_page=100,
+            sparkline=False
+        )
+        
+        # Filter for stable coins (low volatility, high volume)
+        stable_coins = []
+        for coin in markets:
+            if coin['total_volume'] > 1000000:  # Minimum volume threshold
+                try:
+                    # Get volatility data
+                    price_data = cg.get_coin_market_chart_by_id(
+                        id=coin['id'],
+                        vs_currency='usd',
+                        days='7'
+                    )
+                    
+                    prices = pd.DataFrame(price_data['prices'], columns=['timestamp', 'price'])
+                    volatility = prices['price'].std() / prices['price'].mean()
+                    
+                    # Look for low volatility coins
+                    if volatility < 0.05:  # 5% volatility threshold
+                        stable_coins.append((coin, volatility))
+                        
+                except Exception:
+                    continue
+                    
+                if len(stable_coins) >= 5:
+                    break
+        
+        # Analyze potential grid trading coins
+        results = []
+        for coin, volatility in stable_coins:
+            try:
+                # Calculate grid parameters
+                price = coin['current_price']
+                upper_price = price * (1 + volatility * 2)
+                lower_price = price * (1 - volatility * 2)
+                grid_levels = min(max(int(1/volatility), 3), 100)
+                
+                # Calculate grid score based on volume and volatility
+                volume_score = min(coin['total_volume'] / 1e9, 1)  # Normalize volume
+                volatility_score = 1 - (volatility * 10)  # Lower volatility is better
+                grid_score = (volume_score + volatility_score) / 2
+                
+                results.append(GridTradingCoin(
+                    coin_id=coin['id'],
+                    name=coin['name'],
+                    current_price=coin['current_price'],
+                    volatility_24h=volatility * 100,  # Convert to percentage
+                    volume_24h=coin['total_volume'],
+                    market_cap=coin['market_cap'],
+                    grid_score=grid_score,
+                    analysis=f"This coin shows stable price action with {volatility*100:.1f}% volatility and good trading volume. Suitable for grid trading with {grid_levels} levels.",
+                    upper_price=upper_price,
+                    lower_price=lower_price,
+                    grid_levels=grid_levels
+                ))
+                
+            except Exception:
+                continue
+                
+            if len(results) >= 3:
+                break
+        
+        # Sort by grid score
+        results.sort(key=lambda x: x.grid_score, reverse=True)
+        return results[:3]
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error finding grid trading coins: {str(e)}"
         )
 
 if __name__ == "__main__" and not os.getenv("VERCEL"):
