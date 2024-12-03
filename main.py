@@ -1,7 +1,5 @@
 from flask import Flask, jsonify, request
-from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
+from langchain_google_genai import ChatGoogleGenerativeAI
 from pycoingecko import CoinGeckoAPI
 import os
 from dotenv import load_dotenv
@@ -20,11 +18,11 @@ app = Flask(__name__)
 # Initialize APIs
 cg = CoinGeckoAPI()
 
-# Initialize OpenAI
-llm = ChatOpenAI(
-    model="gpt-4-turbo-preview",
+# Initialize Gemini
+llm = ChatGoogleGenerativeAI(
+    model="gemini-pro",
     temperature=0.7,
-    openai_api_key=os.getenv("OPENAI_API_KEY")
+    google_api_key=os.getenv("GEMINI_API_KEY")
 )
 
 # Cache market data for 5 minutes
@@ -221,7 +219,7 @@ Return ONLY a JSON object in this exact format (no other text):
 
 IMPORTANT: Do not include any markdown formatting or code blocks in your response. Return only the raw JSON object."""
 
-        # Get analysis from OpenAI
+        # Get analysis from Gemini
         response = llm.invoke(analysis_prompt)
         
         # Extract content and remove markdown formatting
