@@ -1,7 +1,7 @@
 flask
 langchain
 langchain-google-genai
-pycoingecko
+python-binance
 pandas
 numpy
 python-dotenv
@@ -12,3 +12,4 @@ python-multipart
 aiohttp
 yfinance
 google-api-python-client
+ta  # Technical Analysis library
