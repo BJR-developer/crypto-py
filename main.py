@@ -1,379 +1,254 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import os
-from pycoingecko import CoinGeckoAPI
+from flask import Flask, jsonify, request
+from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-from langchain_openai import ChatOpenAI
+from pycoingecko import CoinGeckoAPI
+import os
 from dotenv import load_dotenv
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Dict, Any
+import numpy as np
 import json
-import re
+from functools import lru_cache
 
 # Load environment variables
 load_dotenv()
 
-# Initialize FastAPI
-app = FastAPI(
-    title="Crypto Trading Signals API",
-    description="API for cryptocurrency analysis and trading signals using technical analysis and AI",
-    version="1.0.0"
-)
+# Initialize Flask app
+app = Flask(__name__)
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize CoinGecko API client
+# Initialize APIs
 cg = CoinGeckoAPI()
 
 # Initialize OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
+llm = ChatOpenAI(
+    model="gpt-4-turbo-preview",
+    temperature=0.7,
+    openai_api_key=os.getenv("OPENAI_API_KEY")
+)
 
-def get_ai_model():
-    """Get the OpenAI model instance"""
-    return ChatOpenAI(
-        model="gpt-4-turbo-preview",
-        temperature=0,
-        openai_api_key=OPENAI_API_KEY
-    )
+# Cache market data for 5 minutes
+@lru_cache(maxsize=100)
+def get_cached_market_data(coin_id: str, timestamp: str) -> dict:
+    return get_market_data(coin_id)
 
-def get_market_sentiment_prompt(market_data: Dict[str, Any], technical_indicators: Dict[str, float]) -> str:
-    """Generate prompt for AI analysis based on market data"""
-    return f"""You are a professional cryptocurrency analyst. Analyze the following market data and provide a trading signal.
+# Cache technical indicators for 5 minutes
+@lru_cache(maxsize=100)
+def get_cached_technical_indicators(coin_id: str, timestamp: str) -> dict:
+    return get_technical_indicators(coin_id)
 
-Market Data:
-- Current Price: ${market_data['current_price']['usd']}
-- 24h Price Change: {market_data['price_change_percentage_24h']}%
-- Market Cap: ${market_data['market_cap']['usd']}
-- 24h Trading Volume: ${market_data['total_volume']['usd']}
+# Cache news for 30 minutes
+@lru_cache(maxsize=100)
+def get_cached_news(coin_id: str, timestamp: str) -> str:
+    return get_news_and_sentiment(coin_id)
 
-Technical Indicators:
-- RSI (14): {technical_indicators['rsi']:.2f}
-- Trend: {technical_indicators['trend']}
+def get_market_data(coin_id: str) -> dict:
+    """Get comprehensive market data for a cryptocurrency"""
+    try:
+        # Get current market data
+        coin_data = cg.get_coin_by_id(coin_id)
+        market_data = coin_data["market_data"]
+        
+        return {
+            "current_price": market_data["current_price"]["usd"],
+            "24h_change": market_data["price_change_percentage_24h"],
+            "7d_change": market_data["price_change_percentage_7d"],
+            "market_cap": market_data["market_cap"]["usd"],
+            "total_volume": market_data["total_volume"]["usd"],
+            "ath": market_data["ath"]["usd"],
+            "ath_change_percentage": market_data["ath_change_percentage"]["usd"],
+            "market_cap_rank": coin_data["market_cap_rank"]
+        }
+    except Exception as e:
+        return f"Error fetching market data: {str(e)}"
 
-Based on this data, provide your analysis in this EXACT JSON format:
+def get_technical_indicators(coin_id: str) -> dict:
+    """Calculate technical indicators for a cryptocurrency"""
+    try:
+        # Get historical price data
+        data = cg.get_coin_market_chart_by_id(id=coin_id, vs_currency='usd', days=30)
+        df = pd.DataFrame(data['prices'], columns=['timestamp', 'price'])
+        
+        # Calculate various technical indicators
+        # SMA
+        df['SMA_20'] = df['price'].rolling(window=20).mean()
+        df['SMA_50'] = df['price'].rolling(window=50).mean()
+        
+        # EMA
+        df['EMA_12'] = df['price'].ewm(span=12).mean()
+        df['EMA_26'] = df['price'].ewm(span=26).mean()
+        
+        # MACD
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['Signal_Line'] = df['MACD'].ewm(span=9).mean()
+        
+        # RSI
+        delta = df['price'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # Bollinger Bands
+        df['BB_middle'] = df['price'].rolling(window=20).mean()
+        df['BB_upper'] = df['BB_middle'] + 2 * df['price'].rolling(window=20).std()
+        df['BB_lower'] = df['BB_middle'] - 2 * df['price'].rolling(window=20).std()
+        
+        # Get latest values
+        latest = df.iloc[-1]
+        
+        # Calculate volatility
+        volatility = df['price'].pct_change().std() * np.sqrt(365) * 100
+        
+        return {
+            "sma_20": latest['SMA_20'],
+            "sma_50": latest['SMA_50'],
+            "rsi": latest['RSI'],
+            "macd": latest['MACD'],
+            "signal_line": latest['Signal_Line'],
+            "bollinger_upper": latest['BB_upper'],
+            "bollinger_middle": latest['BB_middle'],
+            "bollinger_lower": latest['BB_lower'],
+            "volatility": volatility,
+            "trend": "BULLISH" if latest['SMA_20'] > latest['SMA_50'] else "BEARISH"
+        }
+    except Exception as e:
+        return f"Error calculating technical indicators: {str(e)}"
+
+def get_news_and_sentiment(coin_id: str) -> str:
+    """Get latest news and sentiment for a cryptocurrency"""
+    try:
+        # Get coin data to get the proper name
+        coin_data = cg.get_coin_by_id(coin_id)
+        coin_name = coin_data["name"]
+        
+        # Get news from CoinGecko
+        status_updates = coin_data.get("status_updates", [])
+        description = coin_data.get("description", {}).get("en", "")
+        sentiment = coin_data.get("sentiment_votes_up_percentage", 0)
+        
+        # Get additional market data
+        market_data = coin_data["market_data"]
+        
+        news_summary = f"""
+Market Sentiment: {sentiment}% positive
+Developer Activity: Active
+Community Score: {coin_data.get('community_score', 0)}
+Market Sentiment: {coin_data.get('sentiment_votes_up_percentage', 0)}%
+
+Project Description:
+{description[:500]}...
+
+Recent Updates:
+"""
+        
+        # Add recent status updates if available
+        if status_updates:
+            for update in status_updates[:3]:
+                news_summary += f"- {update.get('description', '')}\n"
+        
+        return news_summary
+    except Exception as e:
+        return f"Error fetching news: {str(e)}"
+
+@app.route('/analyze', methods=['POST'])
+def analyze_market():
+    try:
+        data = request.get_json()
+        coin_id = data.get('coin_id', 'bitcoin')
+        
+        # Create timestamp for cache (updates every 5 minutes)
+        cache_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        cache_timestamp_5min = cache_timestamp[:-1] + "0"  # Round to nearest 5 minutes
+        cache_timestamp_30min = cache_timestamp[:-2] + "00"  # Round to nearest 30 minutes
+        
+        # Gather all data using cached functions
+        market_data = get_cached_market_data(coin_id, cache_timestamp_5min)
+        technical_data = get_cached_technical_indicators(coin_id, cache_timestamp_5min)
+        news = get_cached_news(coin_id, cache_timestamp_30min)
+        
+        # Get coin name
+        coin_data = cg.get_coin_by_id(coin_id)
+        coin_name = coin_data["name"]
+        
+        # Create the analysis prompt
+        analysis_prompt = f"""You are an expert cryptocurrency analyst with deep knowledge of technical analysis, market fundamentals, and sentiment analysis.
+Your task is to analyze the data and provide a JSON response with your analysis.
+
+Analyze the following data for {coin_name} and provide a detailed trading signal and analysis:
+
+MARKET DATA:
+- Current Price: ${market_data['current_price']:,.2f}
+- 24h Change: {market_data['24h_change']:.2f}%
+- 7d Change: {market_data['7d_change']:.2f}%
+- Market Cap: ${market_data['market_cap']:,.2f}
+- Trading Volume: ${market_data['total_volume']:,.2f}
+- Market Cap Rank: #{market_data['market_cap_rank']}
+- ATH: ${market_data['ath']:,.2f} ({market_data['ath_change_percentage']:.2f}% from ATH)
+
+TECHNICAL INDICATORS:
+- RSI (14): {technical_data['rsi']:.2f}
+- MACD: {technical_data['macd']:.2f}
+- Signal Line: {technical_data['signal_line']:.2f}
+- SMA 20: ${technical_data['sma_20']:,.2f}
+- SMA 50: ${technical_data['sma_50']:,.2f}
+- Volatility: {technical_data['volatility']:.2f}%
+- Overall Trend: {technical_data['trend']}
+- Bollinger Bands:
+  * Upper: ${technical_data['bollinger_upper']:,.2f}
+  * Middle: ${technical_data['bollinger_middle']:,.2f}
+  * Lower: ${technical_data['bollinger_lower']:,.2f}
+
+RECENT NEWS AND SENTIMENT:
+{news}
+
+Return ONLY a JSON object in this exact format (no other text):
 {{
-    "signal": "BULLISH",
-    "confidence": 0.8,
-    "target": {market_data['current_price']['usd'] * 1.05},
-    "stop_loss": {market_data['current_price']['usd'] * 0.95},
-    "analysis": "Brief analysis of the market conditions and trading recommendation."
+    "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
+    "confidence_score": <0.0-1.0>,
+    "price_prediction": {{
+        "24h": <predicted_price>,
+        "7d": <predicted_price>
+    }},
+    "risk_level": "LOW/MEDIUM/HIGH",
+    "technical_analysis": "Detailed technical analysis with key points",
+    "fundamental_analysis": "Analysis of market data and fundamentals",
+    "sentiment_analysis": "Analysis of news and market sentiment",
+    "key_takeaways": ["List", "of", "key", "points"],
+    "risk_factors": ["List", "of", "potential", "risks"],
+    "recommendation": "Detailed trading recommendation and strategy"
 }}
 
-IMPORTANT: Return ONLY the JSON object, exactly as shown above. No other text."""
+IMPORTANT: Do not include any markdown formatting or code blocks in your response. Return only the raw JSON object."""
 
-def calculate_technical_indicators(prices):
-    """Calculate simple technical indicators from price data"""
-    if len(prices) < 15:  # Need at least 15 data points
-        return {'rsi': 50, 'trend': 'NEUTRAL'}
+        # Get analysis from OpenAI
+        response = llm.invoke(analysis_prompt)
         
-    df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+        # Extract content and remove markdown formatting
+        analysis_text = response.content
+        if "```json" in analysis_text:
+            analysis_text = analysis_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in analysis_text:
+            analysis_text = analysis_text.split("```")[1].strip()
+            
+        # Parse JSON
+        analysis_json = json.loads(analysis_text)
+        
+        return jsonify({
+            'coin_id': coin_id,
+            'coin_name': coin_name,
+            'timestamp': datetime.now().isoformat(),
+            'analysis': analysis_json
+        })
     
-    # Simple RSI calculation
-    changes = df['price'].diff()
-    gains = changes.where(changes > 0, 0)
-    losses = -changes.where(changes < 0, 0)
-    
-    # Simple moving averages of gains and losses
-    avg_gain = gains.rolling(window=14, min_periods=1).mean()
-    avg_loss = losses.rolling(window=14, min_periods=1).mean()
-    
-    # Safe RSI calculation
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    
-    # Handle potential NaN values
-    final_rsi = float(rsi.iloc[-1])
-    if pd.isna(final_rsi):
-        final_rsi = 50  # Neutral RSI if calculation fails
-        
-    return {
-        'rsi': min(100, max(0, final_rsi)),  # Ensure RSI is between 0-100
-        'trend': 'BULLISH' if df['price'].iloc[-1] > df['price'].iloc[-5] else 'BEARISH'
-    }
-
-class CryptoRequest(BaseModel):
-    coin_id: str = Field(..., description="The ID of the cryptocurrency (e.g., 'bitcoin')")
-    days: Optional[int] = Field(default=30, description="Number of days of historical data to analyze")
-
-class CryptoSignal(BaseModel):
-    coin_id: str = Field(..., description="The ID of the cryptocurrency")
-    signal: str = Field(..., description="The trading signal (BULLISH or BEARISH)")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="The confidence level of the signal (0.0-1.0)")
-    current_price: float = Field(..., gt=0, description="The current price of the cryptocurrency")
-    price_change_24h: float = Field(..., description="The 24h price change percentage")
-    rsi_value: float = Field(..., ge=0, le=100, description="The RSI value (0-100)")
-    macd_signal: str = Field(..., description="The MACD signal (BULLISH or BEARISH)")
-    analysis: str = Field(..., min_length=10, description="The detailed market analysis")
-    next_target: float = Field(..., gt=0, description="The next price target")
-    stop_loss: float = Field(..., gt=0, description="The recommended stop loss level")
-
-class TopCoin(BaseModel):
-    coin_id: str = Field(..., description="The ID of the cryptocurrency")
-    name: str = Field(..., description="The name of the cryptocurrency")
-    current_price: float = Field(..., gt=0, description="Current price in USD")
-    price_change_24h: float = Field(..., description="24h price change percentage")
-    volume_24h: float = Field(..., gt=0, description="24h trading volume")
-    market_cap: float = Field(..., gt=0, description="Market capitalization")
-    confidence_score: float = Field(..., ge=0.0, le=1.0, description="AI confidence score")
-    analysis: str = Field(..., min_length=10, description="Trading analysis and rationale")
-    target_price: float = Field(..., gt=0, description="Target price prediction")
-    stop_loss: float = Field(..., gt=0, description="Recommended stop loss")
-
-class GridTradingCoin(BaseModel):
-    coin_id: str = Field(..., description="The ID of the cryptocurrency")
-    name: str = Field(..., description="The name of the cryptocurrency")
-    current_price: float = Field(..., gt=0, description="Current price in USD")
-    volatility_24h: float = Field(..., description="24h price volatility")
-    volume_24h: float = Field(..., gt=0, description="24h trading volume")
-    market_cap: float = Field(..., gt=0, description="Market capitalization")
-    grid_score: float = Field(..., ge=0.0, le=1.0, description="Suitability score for grid trading")
-    analysis: str = Field(..., min_length=10, description="Analysis of suitability for grid trading")
-    upper_price: float = Field(..., gt=0, description="Recommended upper grid price")
-    lower_price: float = Field(..., gt=0, description="Recommended lower grid price")
-    grid_levels: int = Field(..., ge=3, le=100, description="Recommended number of grid levels")
-
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the Crypto Trading Signals API"}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.get("/trading_signal/{coin_id}", response_model=CryptoSignal)
-async def get_trading_signal(coin_id: str, days: int = 30):
-    try:
-        # Normalize coin_id
-        coin_id = coin_id.lower().strip()
-        
-        # Common mappings for popular coins
-        coin_mappings = {
-            "xrp": "ripple",
-            "btc": "bitcoin",
-            "eth": "ethereum",
-            "doge": "dogecoin"
-        }
-        
-        # Use mapping if available
-        coin_id = coin_mappings.get(coin_id, coin_id)
-        
-        try:
-            # Get market data
-            coin_data = cg.get_coin_by_id(
-                id=coin_id,
-                localization=False,
-                tickers=False,
-                market_data=True,
-                community_data=False,
-                developer_data=False,
-                sparkline=False
-            )
-        except Exception as e:
-            if "could not find coin with the given id" in str(e).lower():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Cryptocurrency '{coin_id}' not found. Please check the coin ID and try again."
-                )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error fetching market data: {str(e)}"
-            )
-        
-        market_data = coin_data['market_data']
-        
-        # Get historical price data
-        try:
-            price_data = cg.get_coin_market_chart_by_id(
-                id=coin_id,
-                vs_currency='usd',
-                days=str(days)
-            )
-            prices = price_data['prices']
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error fetching historical price data: {str(e)}"
-            )
-        
-        # Calculate technical indicators
-        try:
-            technical_indicators = calculate_technical_indicators(prices)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error calculating technical indicators: {str(e)}"
-            )
-        
-        # Create analysis prompt
-        try:
-            model = get_ai_model()
-            prompt = PromptTemplate(
-                input_variables=["market_data"],
-                template="{market_data}"
-            )
-            
-            # Create chain and get analysis
-            sentiment_chain = LLMChain(llm=model, prompt=prompt)
-            analysis_result = sentiment_chain.run(market_data=get_market_sentiment_prompt(market_data, technical_indicators))
-            
-            # Parse the analysis result
-            try:
-                analysis_result = json.loads(analysis_result)
-            except json.JSONDecodeError:
-                raise ValueError("Invalid JSON response from AI model")
-            
-            if not all(key in analysis_result for key in ['signal', 'confidence', 'target', 'stop_loss', 'analysis']):
-                raise ValueError("Invalid response from AI model. Missing required keys.")
-            
-            return CryptoSignal(
-                coin_id=coin_id,
-                signal=analysis_result['signal'].upper(),
-                confidence=analysis_result['confidence'],
-                current_price=market_data['current_price']['usd'],
-                price_change_24h=market_data['price_change_percentage_24h'],
-                rsi_value=technical_indicators['rsi'],
-                macd_signal="BULLISH" if technical_indicators['trend'] == 'BULLISH' else "BEARISH",
-                analysis=analysis_result['analysis'],
-                next_target=analysis_result['target'],
-                stop_loss=analysis_result['stop_loss']
-            )
-            
-        except ValueError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error parsing AI response: {str(e)}"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error generating AI analysis: {str(e)}"
-            )
-            
-    except HTTPException:
-        raise
+    except json.JSONDecodeError as e:
+        return jsonify({
+            'error': 'Failed to parse AI response as JSON',
+            'raw_response': analysis_text if 'analysis_text' in locals() else None,
+            'error_details': str(e)
+        }), 500
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error: {str(e)}"
-        )
+        return jsonify({'error': str(e)}), 500
 
-@app.get("/supported_coins")
-async def get_supported_coins():
-    """Get a list of supported cryptocurrencies"""
-    try:
-        coins_list = cg.get_coins_list()
-        # Return only the most relevant information
-        return {
-            "supported_coins": [
-                {
-                    "id": coin["id"],
-                    "symbol": coin["symbol"],
-                    "name": coin["name"]
-                }
-                for coin in coins_list
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching supported coins: {str(e)}"
-        )
-
-@app.get("/best_grid_trading_coins", response_model=list[GridTradingCoin])
-async def get_best_grid_trading_coins():
-    """Find the top 3 stable coins suitable for grid trading"""
-    try:
-        # Get top 100 coins by market cap
-        markets = cg.get_coins_markets(
-            vs_currency='usd',
-            order='market_cap_desc',
-            per_page=100,
-            sparkline=False
-        )
-        
-        # Filter for stable coins (low volatility, high volume)
-        stable_coins = []
-        for coin in markets:
-            if coin['total_volume'] > 1000000:  # Minimum volume threshold
-                try:
-                    # Get volatility data
-                    price_data = cg.get_coin_market_chart_by_id(
-                        id=coin['id'],
-                        vs_currency='usd',
-                        days='7'
-                    )
-                    
-                    prices = pd.DataFrame(price_data['prices'], columns=['timestamp', 'price'])
-                    volatility = prices['price'].std() / prices['price'].mean()
-                    
-                    # Look for low volatility coins
-                    if volatility < 0.05:  # 5% volatility threshold
-                        stable_coins.append((coin, volatility))
-                        
-                except Exception:
-                    continue
-                    
-                if len(stable_coins) >= 5:
-                    break
-        
-        # Analyze potential grid trading coins
-        results = []
-        for coin, volatility in stable_coins:
-            try:
-                # Calculate grid parameters
-                price = coin['current_price']
-                upper_price = price * (1 + volatility * 2)
-                lower_price = price * (1 - volatility * 2)
-                grid_levels = min(max(int(1/volatility), 3), 100)
-                
-                # Calculate grid score based on volume and volatility
-                volume_score = min(coin['total_volume'] / 1e9, 1)  # Normalize volume
-                volatility_score = 1 - (volatility * 10)  # Lower volatility is better
-                grid_score = (volume_score + volatility_score) / 2
-                
-                results.append(GridTradingCoin(
-                    coin_id=coin['id'],
-                    name=coin['name'],
-                    current_price=coin['current_price'],
-                    volatility_24h=volatility * 100,  # Convert to percentage
-                    volume_24h=coin['total_volume'],
-                    market_cap=coin['market_cap'],
-                    grid_score=grid_score,
-                    analysis=f"This coin shows stable price action with {volatility*100:.1f}% volatility and good trading volume. Suitable for grid trading with {grid_levels} levels.",
-                    upper_price=upper_price,
-                    lower_price=lower_price,
-                    grid_levels=grid_levels
-                ))
-                
-            except Exception:
-                continue
-                
-            if len(results) >= 3:
-                break
-        
-        # Sort by grid score
-        results.sort(key=lambda x: x.grid_score, reverse=True)
-        return results[:3]
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error finding grid trading coins: {str(e)}"
-        )
-
-if __name__ == "__main__" and not os.getenv("VERCEL"):
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+if __name__ == '__main__':
+    app.run(debug=True)
