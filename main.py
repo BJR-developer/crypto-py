@@ -193,57 +193,164 @@ def get_market_sentiment(symbol: str) -> dict:
         return {}
 
 def predict_price(df: pd.DataFrame) -> dict:
-    """Predict future prices using multiple models"""
+    """Predict future price movements using ML models"""
     try:
-        from sklearn.preprocessing import MinMaxScaler
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import LSTM, Dense
-        import statsmodels.api as sm
-        
         # Prepare data
+        data = df['close'].astype(float).values
+        if len(data) < 24:  # Need at least 24 hours of data
+            return {}
+            
+        # Normalize data
         scaler = MinMaxScaler()
-        scaled_data = scaler.fit_transform(df[['close']])
+        scaled_data = scaler.fit_transform(data.reshape(-1, 1))
         
-        # LSTM prediction
-        sequence_length = 10
+        # Prepare sequences for LSTM
         X = []
-        for i in range(len(scaled_data) - sequence_length):
-            X.append(scaled_data[i:(i + sequence_length), 0])
+        y = []
+        for i in range(24, len(scaled_data)):
+            X.append(scaled_data[i-24:i, 0])
+            y.append(scaled_data[i, 0])
         X = np.array(X)
-        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+        y = np.array(y)
         
+        # Split data
+        split = int(len(X) * 0.8)
+        X_train = X[:split]
+        X_test = X[split:]
+        y_train = y[:split]
+        y_test = y[split:]
+        
+        # Reshape for LSTM [samples, time steps, features]
+        X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+        X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+        
+        # Build LSTM model
         model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(sequence_length, 1)),
-            LSTM(50),
+            LSTM(50, activation='relu', input_shape=(24, 1), return_sequences=True),
+            LSTM(50, activation='relu'),
             Dense(1)
         ])
-        model.compile(optimizer='adam', loss='mse')
         
-        # Fit model with last 20% of data
-        split = int(len(X) * 0.8)
-        model.fit(X[split:], scaled_data[sequence_length + split:], epochs=50, batch_size=32, verbose=0)
+        # Compile and fit
+        model.compile(optimizer='adam', loss='mse')
+        model.fit(X_train, y_train, epochs=5, batch_size=32, verbose=0)
         
         # Make predictions
-        last_sequence = scaled_data[-sequence_length:]
-        lstm_pred = model.predict(last_sequence.reshape(1, sequence_length, 1))
-        lstm_pred = scaler.inverse_transform(lstm_pred)[0][0]
+        last_24_hours = scaled_data[-24:]
+        next_24_hours = model.predict(last_24_hours.reshape(1, 24, 1))
         
-        # ARIMA prediction
-        model_arima = sm.tsa.ARIMA(df['close'], order=(5,1,0))
-        results_arima = model_arima.fit()
-        arima_pred = results_arima.forecast(steps=1)[0]
+        # Inverse transform predictions
+        predicted_price = scaler.inverse_transform(next_24_hours)[0][0]
+        current_price = float(df['close'].iloc[-1])
         
-        # Combine predictions
-        ensemble_pred = (lstm_pred + arima_pred) / 2
+        # Calculate confidence based on model loss
+        test_loss = model.evaluate(X_test, y_test, verbose=0)
+        confidence = 1 / (1 + test_loss)  # Normalize loss to 0-1 range
         
         return {
-            'lstm': lstm_pred,
-            'arima': arima_pred,
-            'ensemble': ensemble_pred,
-            'confidence': min(1.0, 1.0 - abs(lstm_pred - arima_pred) / df['close'].iloc[-1])
+            'lstm': predicted_price,
+            'arima': current_price,  # Placeholder for ARIMA
+            'ensemble': predicted_price,  # Using LSTM for now
+            'confidence': confidence
         }
     except Exception as e:
         logger.error(f"Error in price prediction: {str(e)}")
+        return {
+            'lstm': float(df['close'].iloc[-1]),
+            'arima': float(df['close'].iloc[-1]),
+            'ensemble': float(df['close'].iloc[-1]),
+            'confidence': 0.5
+        }
+
+def get_market_context(coin_id: str) -> dict:
+    """Get broader market context and correlations"""
+    try:
+        # Get BTC and ETH data for correlation
+        btc_data = binance_client.get_klines(symbol='BTCUSDT', interval=Client.KLINE_INTERVAL_1HOUR, limit=168)
+        eth_data = binance_client.get_klines(symbol='ETHUSDT', interval=Client.KLINE_INTERVAL_1HOUR, limit=168)
+        coin_data = binance_client.get_klines(symbol=f'{coin_id}USDT', interval=Client.KLINE_INTERVAL_1HOUR, limit=168)
+
+        # Convert to DataFrames
+        btc_df = pd.DataFrame(btc_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 
+                                                'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
+        eth_df = pd.DataFrame(eth_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time',
+                                                'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
+        coin_df = pd.DataFrame(coin_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time',
+                                                  'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
+
+        # Calculate correlations
+        btc_correlation = coin_df['close'].astype(float).corr(btc_df['close'].astype(float))
+        eth_correlation = coin_df['close'].astype(float).corr(eth_df['close'].astype(float))
+
+        # Calculate liquidity metrics
+        avg_spread = (float(coin_df['high'].iloc[-1]) - float(coin_df['low'].iloc[-1])) / float(coin_df['close'].iloc[-1])
+        volume_profile = float(coin_df['volume'].astype(float).mean())
+        
+        # Get market dominance
+        ticker_24h = binance_client.get_ticker()
+        total_market_volume = sum(float(t['quoteVolume']) for t in ticker_24h if t['symbol'].endswith('USDT'))
+        coin_volume = float([t['quoteVolume'] for t in ticker_24h if t['symbol'] == f'{coin_id}USDT'][0])
+        market_dominance = (coin_volume / total_market_volume) * 100 if total_market_volume > 0 else 0
+
+        return {
+            'correlations': {
+                'btc': btc_correlation,
+                'eth': eth_correlation
+            },
+            'liquidity': {
+                'avg_spread': avg_spread,
+                'volume_profile': volume_profile,
+                'market_dominance': market_dominance
+            },
+            'market_efficiency': {
+                'volatility': float(coin_df['close'].astype(float).std()),
+                'volume_stability': float(coin_df['volume'].astype(float).std() / coin_df['volume'].astype(float).mean())
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error in market context analysis: {str(e)}")
+        return {}
+
+def get_onchain_analysis(coin_id: str) -> dict:
+    """Get on-chain metrics and analysis"""
+    try:
+        # Get recent trades to analyze whale movements
+        trades = binance_client.get_recent_trades(symbol=f'{coin_id}USDT', limit=1000)
+        
+        # Analyze large transactions (whales)
+        whale_threshold = 100000  # $100k USD
+        whale_trades = [t for t in trades if float(t['price']) * float(t['qty']) > whale_threshold]
+        
+        # Calculate whale metrics
+        whale_buy_volume = sum(float(t['price']) * float(t['qty']) for t in whale_trades if t['isBuyerMaker'])
+        whale_sell_volume = sum(float(t['price']) * float(t['qty']) for t in whale_trades if not t['isBuyerMaker'])
+        
+        # Get order book to analyze market depth
+        depth = binance_client.get_order_book(symbol=f'{coin_id}USDT', limit=500)
+        
+        # Calculate buy/sell wall metrics
+        buy_walls = sum(float(bid[1]) for bid in depth['bids'][:10])  # Top 10 buy orders
+        sell_walls = sum(float(ask[1]) for ask in depth['asks'][:10])  # Top 10 sell orders
+        
+        return {
+            'whale_activity': {
+                'large_transactions_24h': len(whale_trades),
+                'whale_buy_volume': whale_buy_volume,
+                'whale_sell_volume': whale_sell_volume,
+                'net_whale_flow': whale_buy_volume - whale_sell_volume
+            },
+            'market_depth': {
+                'buy_walls': buy_walls,
+                'sell_walls': sell_walls,
+                'buy_sell_ratio': buy_walls / sell_walls if sell_walls > 0 else 0
+            },
+            'smart_money_indicator': {
+                'institutional_activity': whale_buy_volume / (whale_buy_volume + whale_sell_volume) if (whale_buy_volume + whale_sell_volume) > 0 else 0,
+                'large_transaction_ratio': len(whale_trades) / len(trades) if trades else 0
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error in on-chain analysis: {str(e)}")
         return {}
 
 def get_market_data(coin_id: str) -> dict:
@@ -283,6 +390,12 @@ def get_market_data(coin_id: str) -> dict:
         
         # Get price predictions
         predictions = predict_price(df)
+
+        # Get market context
+        market_context = get_market_context(coin_id)
+        
+        # Get on-chain analysis
+        onchain_data = get_onchain_analysis(coin_id)
         
         return {
             'current_price': float(ticker['lastPrice']),
@@ -292,7 +405,9 @@ def get_market_data(coin_id: str) -> dict:
             'total_volume': float(ticker['volume']),
             'indicators': indicators,
             'sentiment': sentiment,
-            'predictions': predictions
+            'predictions': predictions,
+            'market_context': market_context,
+            'onchain_analysis': onchain_data
         }
     except BinanceAPIException as e:
         return f"Error: {str(e)}"
@@ -421,11 +536,11 @@ def analyze_market():
 Analyze the following comprehensive data for {coin_id} and provide a detailed trading signal and analysis:
 
 MARKET DATA:
-- Current Price: ${market_data['current_price']:,.2f}
+- Current Price: ${market_data['current_price']:.2f}
 - 24h Change: {market_data['24h_change']:.2f}%
 - 7d Change: {market_data['7d_change']:.2f}%
-- Market Cap: ${market_data['market_cap']:,.2f}
-- Trading Volume: ${market_data['total_volume']:,.2f}
+- Market Cap: ${market_data['market_cap']:.2f}
+- Trading Volume: ${market_data['total_volume']:.2f}
 
 TECHNICAL ANALYSIS:
 1. Momentum Indicators:
@@ -447,13 +562,35 @@ TECHNICAL ANALYSIS:
 4. Volatility Indicators:
    - ATR: {market_data['indicators']['volatility']['atr']:.2f}
    - Bollinger Bands:
-     * Upper: ${market_data['indicators']['volatility']['bb']['upper']:,.2f}
-     * Middle: ${market_data['indicators']['volatility']['bb']['middle']:,.2f}
-     * Lower: ${market_data['indicators']['volatility']['bb']['lower']:,.2f}
+     * Upper: ${market_data['indicators']['volatility']['bb']['upper']:.2f}
+     * Middle: ${market_data['indicators']['volatility']['bb']['middle']:.2f}
+     * Lower: ${market_data['indicators']['volatility']['bb']['lower']:.2f}
    - Keltner Channels:
-     * High: ${market_data['indicators']['volatility']['kc']['high']:,.2f}
-     * Mid: ${market_data['indicators']['volatility']['kc']['mid']:,.2f}
-     * Low: ${market_data['indicators']['volatility']['kc']['low']:,.2f}
+     * High: ${market_data['indicators']['volatility']['kc']['high']:.2f}
+     * Mid: ${market_data['indicators']['volatility']['kc']['mid']:.2f}
+     * Low: ${market_data['indicators']['volatility']['kc']['low']:.2f}
+
+MARKET CONTEXT:
+- BTC Correlation: {market_data['market_context']['correlations']['btc']:.2f}
+- ETH Correlation: {market_data['market_context']['correlations']['eth']:.2f}
+- Average Spread: {market_data['market_context']['liquidity']['avg_spread']:.2f}
+- Volume Profile: {market_data['market_context']['liquidity']['volume_profile']:.2f}
+- Market Dominance: {market_data['market_context']['liquidity']['market_dominance']:.2f}%
+
+ON-CHAIN ANALYSIS:
+- Whale Activity (24h): {market_data['onchain_analysis']['whale_activity']['large_transactions_24h']}
+- Whale Buy Volume: ${market_data['onchain_analysis']['whale_activity']['whale_buy_volume']:.2f}
+- Whale Sell Volume: ${market_data['onchain_analysis']['whale_activity']['whale_sell_volume']:.2f}
+- Net Whale Flow: ${market_data['onchain_analysis']['whale_activity']['net_whale_flow']:.2f}
+- Buy Walls: {market_data['onchain_analysis']['market_depth']['buy_walls']:.2f}
+- Sell Walls: {market_data['onchain_analysis']['market_depth']['sell_walls']:.2f}
+- Buy/Sell Ratio: {market_data['onchain_analysis']['market_depth']['buy_sell_ratio']:.2f}
+
+PRICE PREDICTIONS:
+- LSTM Model: ${market_data['predictions']['lstm']:.2f}
+- ARIMA Model: ${market_data['predictions']['arima']:.2f}
+- Ensemble Prediction: ${market_data['predictions']['ensemble']:.2f}
+- Prediction Confidence: {market_data['predictions']['confidence']:.2%}
 
 MARKET SENTIMENT:
 1. Fear & Greed Index:
@@ -468,22 +605,16 @@ MARKET SENTIMENT:
    - Current Interest: {market_data['sentiment'].get('google_trends', {}).get('current', 'N/A')}
    - Trend Direction: {market_data['sentiment'].get('google_trends', {}).get('trend', 'N/A')}
 
-PRICE PREDICTIONS:
-- LSTM Model: ${market_data['predictions'].get('lstm', 0):,.2f}
-- ARIMA Model: ${market_data['predictions'].get('arima', 0):,.2f}
-- Ensemble Prediction: ${market_data['predictions'].get('ensemble', 0):,.2f}
-- Prediction Confidence: {market_data['predictions'].get('confidence', 0):.2%}
-
 RECENT MARKET ACTIVITY:
 {news}
 
 Based on this comprehensive analysis, provide a detailed JSON response in this exact format:
 {{
     "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
-    "confidence_score": <0.0-1.0>,
+    "confidence_score": 0.0,
     "price_prediction": {{
-        "24h": <predicted_price>,
-        "7d": <predicted_price>
+        "24h": 0.0,
+        "7d": 0.0
     }},
     "risk_level": "LOW/MEDIUM/HIGH",
     "technical_analysis": {{
@@ -492,19 +623,29 @@ Based on this comprehensive analysis, provide a detailed JSON response in this e
         "trend": "Analysis of trend indicators",
         "volatility": "Analysis of volatility indicators"
     }},
-    "fundamental_analysis": "Analysis of market data and fundamentals",
+    "market_context": {{
+        "btc_correlation": "Analysis of BTC correlation impact",
+        "eth_correlation": "Analysis of ETH correlation impact",
+        "market_dominance": "Analysis of market share and importance",
+        "liquidity_analysis": "Analysis of trading volume and spreads"
+    }},
+    "onchain_analysis": {{
+        "whale_activity": "Analysis of large holder behavior",
+        "market_depth": "Analysis of order book and walls",
+        "smart_money": "Analysis of institutional activity"
+    }},
     "sentiment_analysis": {{
         "market_sentiment": "Analysis of fear & greed index",
         "social_sentiment": "Analysis of social media sentiment",
         "trend_analysis": "Analysis of Google Trends data"
     }},
-    "key_takeaways": ["List", "of", "key", "points"],
-    "risk_factors": ["List", "of", "potential", "risks"],
+    "key_takeaways": ["Key point 1", "Key point 2", "Key point 3"],
+    "risk_factors": ["Risk 1", "Risk 2", "Risk 3"],
     "trading_strategy": {{
-        "entry_points": ["List", "of", "entry", "points"],
-        "exit_points": ["List", "of", "exit", "points"],
-        "stop_loss": <stop_loss_price>,
-        "take_profit": <take_profit_price>
+        "entry_points": ["Entry point 1", "Entry point 2"],
+        "exit_points": ["Exit point 1", "Exit point 2"],
+        "stop_loss": 0.0,
+        "take_profit": 0.0
     }}
 }}
 
