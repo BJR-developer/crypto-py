@@ -62,6 +62,86 @@ def create_binance_client(max_retries=3, timeout=30):
             if attempt == max_retries - 1:
                 raise
             time.sleep(2 ** attempt)  # Exponential backoff
+            
+def get_advanced_technical_indicators(df: pd.DataFrame) -> dict:
+    """Calculate advanced technical indicators"""
+    try:
+        # Volume-based indicators
+        df['MFI'] = ta.volume.money_flow_index(df['high'], df['low'], df['close'], df['volume'])
+        df['ADI'] = ta.volume.acc_dist_index(df['high'], df['low'], df['close'], df['volume'])
+        df['OBV'] = ta.volume.on_balance_volume(df['close'], df['volume'])
+        
+        # Momentum indicators
+        df['RSI'] = ta.momentum.rsi(df['close'])
+        df['Stoch'] = ta.momentum.stoch(df['high'], df['low'], df['close'])
+        df['StochRSI'] = ta.momentum.stochrsi(df['close'])
+        df['MACD'] = ta.trend.macd_diff(df['close'])
+        
+        # Trend indicators
+        df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'])
+        df['CCI'] = ta.trend.cci(df['high'], df['low'], df['close'])
+        df['DPO'] = ta.trend.dpo(df['close'])
+        
+        # Volatility indicators
+        bb = ta.volatility.BollingerBands(close=df['close'], window=20, window_dev=2)
+        df['BB_upper'] = bb.bollinger_hband()
+        df['BB_middle'] = bb.bollinger_mavg()
+        df['BB_lower'] = bb.bollinger_lband()
+        
+        df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
+        
+        # Keltner Channels
+        kc = ta.volatility.KeltnerChannel(high=df['high'], low=df['low'], close=df['close'])
+        df['KC_high'] = kc.keltner_channel_hband()
+        df['KC_mid'] = kc.keltner_channel_mband()
+        df['KC_low'] = kc.keltner_channel_lband()
+        
+        # Get latest values
+        latest = df.iloc[-1]
+        
+        return {
+            'momentum': {
+                'rsi': float(latest['RSI']) if not pd.isna(latest['RSI']) else 0,
+                'stoch': float(latest['Stoch']) if not pd.isna(latest['Stoch']) else 0,
+                'stoch_rsi': float(latest['StochRSI']) if not pd.isna(latest['StochRSI']) else 0,
+                'macd': float(latest['MACD']) if not pd.isna(latest['MACD']) else 0
+            },
+            'volume': {
+                'mfi': float(latest['MFI']) if not pd.isna(latest['MFI']) else 0,
+                'adi': float(latest['ADI']) if not pd.isna(latest['ADI']) else 0,
+                'obv': float(latest['OBV']) if not pd.isna(latest['OBV']) else 0
+            },
+            'trend': {
+                'adx': float(latest['ADX']) if not pd.isna(latest['ADX']) else 0,
+                'cci': float(latest['CCI']) if not pd.isna(latest['CCI']) else 0,
+                'dpo': float(latest['DPO']) if not pd.isna(latest['DPO']) else 0
+            },
+            'volatility': {
+                'bb': {
+                    'upper': float(latest['BB_upper']) if not pd.isna(latest['BB_upper']) else 0,
+                    'middle': float(latest['BB_middle']) if not pd.isna(latest['BB_middle']) else 0,
+                    'lower': float(latest['BB_lower']) if not pd.isna(latest['BB_lower']) else 0
+                },
+                'atr': float(latest['ATR']) if not pd.isna(latest['ATR']) else 0,
+                'kc': {
+                    'high': float(latest['KC_high']) if not pd.isna(latest['KC_high']) else 0,
+                    'mid': float(latest['KC_mid']) if not pd.isna(latest['KC_mid']) else 0,
+                    'low': float(latest['KC_low']) if not pd.isna(latest['KC_low']) else 0
+                }
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error calculating technical indicators: {str(e)}")
+        return {
+            'momentum': {'rsi': 0, 'stoch': 0, 'stoch_rsi': 0, 'macd': 0},
+            'volume': {'mfi': 0, 'adi': 0, 'obv': 0},
+            'trend': {'adx': 0, 'cci': 0, 'dpo': 0},
+            'volatility': {
+                'bb': {'upper': 0, 'middle': 0, 'lower': 0},
+                'atr': 0,
+                'kc': {'high': 0, 'mid': 0, 'low': 0}
+            }
+        }
 
 # Initialize Binance client
 try:
@@ -78,117 +158,147 @@ llm = ChatGoogleGenerativeAI(
     google_api_key=os.getenv("GEMINI_API_KEY")
 )
 
-def get_market_data(symbol: str) -> dict:
-    """Get comprehensive market data for a cryptocurrency"""
+def get_market_sentiment(symbol: str) -> dict:
+    """Get market sentiment from multiple sources"""
     try:
-        # Convert symbol to Binance format (e.g., 'bitcoin' to 'BTCUSDT')
-        symbol = symbol.upper()
-        if not symbol.endswith('USDT'):
-            symbol = f"{symbol}USDT"
-
-        # Get ticker data
-        ticker = binance_client.get_ticker(symbol=symbol)
+        # Get fear and greed index
+        fear_greed_url = "https://api.alternative.me/fng/"
+        fear_greed = requests.get(fear_greed_url).json()
         
-        # Get 24h stats
-        stats = binance_client.get_ticker(symbol=symbol)
+        # Get Google Trends data
+        from pytrends.request import TrendReq
+        pytrends = TrendReq()
+        pytrends.build_payload([symbol], timeframe='now 7-d')
+        interest = pytrends.interest_over_time()
         
-        # Get historical klines (candlesticks) for 7d change
-        klines = binance_client.get_historical_klines(
-            symbol=symbol,
-            interval=Client.KLINE_INTERVAL_1DAY,
-            start_str="7 days ago UTC"
-        )
-        
-        # Calculate 7d change
-        if len(klines) >= 7:
-            seven_day_change = ((float(ticker['lastPrice']) - float(klines[0][4])) / float(klines[0][4])) * 100
-        else:
-            seven_day_change = 0
-            
-        return {
-            'current_price': float(ticker['lastPrice']),
-            '24h_change': float(ticker['priceChangePercent']),
-            '7d_change': seven_day_change,
-            'market_cap': float(ticker['quoteVolume']),  # Using quote volume as proxy
-            'total_volume': float(ticker['volume']),
-            'market_cap_rank': None,  # Not available in Binance
-            'ath': None,  # Not available in Binance
-            'ath_change_percentage': None  # Not available in Binance
+        # Get social media sentiment (placeholder - you'd need API keys for real implementation)
+        social_sentiment = {
+            'twitter': 0.65,  # Example value
+            'reddit': 0.58    # Example value
         }
-    except BinanceAPIException as e:
-        return f"Error fetching market data: {str(e)}"
+        
+        return {
+            'fear_greed': {
+                'value': fear_greed['data'][0]['value'],
+                'classification': fear_greed['data'][0]['value_classification']
+            },
+            'google_trends': {
+                'current': interest[symbol].iloc[-1] if not interest.empty else 0,
+                'trend': interest[symbol].pct_change().mean() if not interest.empty else 0
+            },
+            'social': social_sentiment
+        }
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        logger.error(f"Error getting market sentiment: {str(e)}")
+        return {}
 
-def get_technical_indicators(symbol: str) -> dict:
-    """Calculate technical indicators for a cryptocurrency"""
+def predict_price(df: pd.DataFrame) -> dict:
+    """Predict future prices using multiple models"""
     try:
-        # Convert symbol to Binance format
-        symbol = symbol.upper()
-        if not symbol.endswith('USDT'):
-            symbol = f"{symbol}USDT"
+        from sklearn.preprocessing import MinMaxScaler
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import LSTM, Dense
+        import statsmodels.api as sm
+        
+        # Prepare data
+        scaler = MinMaxScaler()
+        scaled_data = scaler.fit_transform(df[['close']])
+        
+        # LSTM prediction
+        sequence_length = 10
+        X = []
+        for i in range(len(scaled_data) - sequence_length):
+            X.append(scaled_data[i:(i + sequence_length), 0])
+        X = np.array(X)
+        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+        
+        model = Sequential([
+            LSTM(50, return_sequences=True, input_shape=(sequence_length, 1)),
+            LSTM(50),
+            Dense(1)
+        ])
+        model.compile(optimizer='adam', loss='mse')
+        
+        # Fit model with last 20% of data
+        split = int(len(X) * 0.8)
+        model.fit(X[split:], scaled_data[sequence_length + split:], epochs=50, batch_size=32, verbose=0)
+        
+        # Make predictions
+        last_sequence = scaled_data[-sequence_length:]
+        lstm_pred = model.predict(last_sequence.reshape(1, sequence_length, 1))
+        lstm_pred = scaler.inverse_transform(lstm_pred)[0][0]
+        
+        # ARIMA prediction
+        model_arima = sm.tsa.ARIMA(df['close'], order=(5,1,0))
+        results_arima = model_arima.fit()
+        arima_pred = results_arima.forecast(steps=1)[0]
+        
+        # Combine predictions
+        ensemble_pred = (lstm_pred + arima_pred) / 2
+        
+        return {
+            'lstm': lstm_pred,
+            'arima': arima_pred,
+            'ensemble': ensemble_pred,
+            'confidence': min(1.0, 1.0 - abs(lstm_pred - arima_pred) / df['close'].iloc[-1])
+        }
+    except Exception as e:
+        logger.error(f"Error in price prediction: {str(e)}")
+        return {}
 
-        # Get historical klines for calculations
+def get_market_data(coin_id: str) -> dict:
+    """Get comprehensive market data"""
+    try:
+        # Get historical klines/candlestick data
+        symbol = f"{coin_id}USDT"
         klines = binance_client.get_historical_klines(
-            symbol=symbol,
-            interval=Client.KLINE_INTERVAL_1HOUR,
-            start_str="30 days ago UTC"
+            symbol,
+            Client.KLINE_INTERVAL_1HOUR,
+            "30 days ago UTC"
         )
+        
+        if not klines:
+            return f"Error: No data available for {coin_id}"
         
         # Convert to DataFrame
         df = pd.DataFrame(klines, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignored'
+            'taker_buy_quote', 'ignore'
         ])
         
-        # Convert price columns to float
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
+        # Convert values to float
+        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
         
-        # Calculate indicators using the ta library
-        # RSI
-        rsi = ta.momentum.RSIIndicator(df['close'], window=14)
-        current_rsi = rsi.rsi().iloc[-1]
+        # Get current market data
+        ticker = binance_client.get_ticker(symbol=symbol)
+        if not ticker:
+            return f"Error: Could not get current price for {coin_id}"
         
-        # MACD
-        macd = ta.trend.MACD(df['close'])
-        current_macd = macd.macd().iloc[-1]
-        current_signal = macd.macd_signal().iloc[-1]
+        # Get advanced indicators
+        indicators = get_advanced_technical_indicators(df)
         
-        # SMA
-        sma_20 = ta.trend.SMAIndicator(df['close'], window=20).sma_indicator().iloc[-1]
-        sma_50 = ta.trend.SMAIndicator(df['close'], window=50).sma_indicator().iloc[-1]
+        # Get market sentiment
+        sentiment = get_market_sentiment(coin_id)
         
-        # Bollinger Bands
-        bollinger = ta.volatility.BollingerBands(df['close'])
-        bb_upper = bollinger.bollinger_hband().iloc[-1]
-        bb_middle = bollinger.bollinger_mavg().iloc[-1]
-        bb_lower = bollinger.bollinger_lband().iloc[-1]
-        
-        # Volatility (using standard deviation of returns)
-        returns = df['close'].pct_change()
-        volatility = returns.std() * 100  # Convert to percentage
-        
-        # Determine trend
-        trend = "BULLISH" if sma_20 > sma_50 else "BEARISH"
+        # Get price predictions
+        predictions = predict_price(df)
         
         return {
-            'rsi': current_rsi,
-            'macd': current_macd,
-            'signal_line': current_signal,
-            'sma_20': sma_20,
-            'sma_50': sma_50,
-            'bollinger_upper': bb_upper,
-            'bollinger_middle': bb_middle,
-            'bollinger_lower': bb_lower,
-            'volatility': volatility,
-            'trend': trend
+            'current_price': float(ticker['lastPrice']),
+            '24h_change': float(ticker['priceChangePercent']),
+            '7d_change': (float(ticker['lastPrice']) - float(df['close'].iloc[-168])) / float(df['close'].iloc[-168]) * 100 if len(df) >= 168 else 0,
+            'market_cap': float(ticker['quoteVolume']),
+            'total_volume': float(ticker['volume']),
+            'indicators': indicators,
+            'sentiment': sentiment,
+            'predictions': predictions
         }
     except BinanceAPIException as e:
-        return f"Error calculating technical indicators: {str(e)}"
+        return f"Error: {str(e)}"
     except Exception as e:
-        return f"Unexpected error: {str(e)}"
+        logger.error(f"Unexpected error in get_market_data: {str(e)}")
+        return f"Error: {str(e)}"
 
 def get_news_and_sentiment(symbol: str) -> str:
     """Get recent trades and market activity as a proxy for news/sentiment"""
@@ -269,19 +379,35 @@ def analyze_market():
             }), 503
 
         data = request.get_json()
-        symbol = data.get('symbol', 'BTC').upper()  # Default to BTC if not specified
+        
+        # Get coin_id from request
+        coin_id = data.get('coin_id', '').upper()
+        if not coin_id:
+            return jsonify({'error': 'coin_id is required'}), 400
+            
+        try:
+            # Get all trading symbols from Binance
+            exchange_info = binance_client.get_exchange_info()
+            valid_symbols = [s['baseAsset'] for s in exchange_info['symbols'] if s['quoteAsset'] == 'USDT']
+            
+            # Check if the coin exists on Binance
+            if coin_id not in valid_symbols:
+                return jsonify({
+                    'error': f'Coin {coin_id} not found on Binance. Available coins: {", ".join(valid_symbols[:10])}...'
+                }), 404
+        
+        except BinanceAPIException as e:
+            return jsonify({
+                'error': f'Failed to validate coin: {str(e)}'
+            }), 503
         
         try:
             # Gather all data with timeout handling
-            market_data = get_market_data(symbol)
+            market_data = get_market_data(coin_id)
             if isinstance(market_data, str) and "Error" in market_data:
                 return jsonify({'error': market_data}), 400
                 
-            technical_data = get_technical_indicators(symbol)
-            if isinstance(technical_data, str) and "Error" in technical_data:
-                return jsonify({'error': technical_data}), 400
-                
-            news = get_news_and_sentiment(symbol)
+            news = get_news_and_sentiment(coin_id)
             if isinstance(news, str) and "Error" in news:
                 news = "Market sentiment data temporarily unavailable"
         
@@ -289,12 +415,10 @@ def analyze_market():
             return jsonify({
                 'error': f'Failed to fetch data from Binance: {str(e)}'
             }), 503
-        
+
         # Create the analysis prompt
         analysis_prompt = f"""You are an expert cryptocurrency analyst with deep knowledge of technical analysis, market fundamentals, and sentiment analysis.
-Your task is to analyze the data and provide a JSON response with your analysis.
-
-Analyze the following data for {symbol} and provide a detailed trading signal and analysis:
+Analyze the following comprehensive data for {coin_id} and provide a detailed trading signal and analysis:
 
 MARKET DATA:
 - Current Price: ${market_data['current_price']:,.2f}
@@ -303,23 +427,57 @@ MARKET DATA:
 - Market Cap: ${market_data['market_cap']:,.2f}
 - Trading Volume: ${market_data['total_volume']:,.2f}
 
-TECHNICAL INDICATORS:
-- RSI (14): {technical_data['rsi']:.2f}
-- MACD: {technical_data['macd']:.2f}
-- Signal Line: {technical_data['signal_line']:.2f}
-- SMA 20: ${technical_data['sma_20']:,.2f}
-- SMA 50: ${technical_data['sma_50']:,.2f}
-- Volatility: {technical_data['volatility']:.2f}%
-- Overall Trend: {technical_data['trend']}
-- Bollinger Bands:
-  * Upper: ${technical_data['bollinger_upper']:,.2f}
-  * Middle: ${technical_data['bollinger_middle']:,.2f}
-  * Lower: ${technical_data['bollinger_lower']:,.2f}
+TECHNICAL ANALYSIS:
+1. Momentum Indicators:
+   - RSI (14): {market_data['indicators']['momentum']['rsi']:.2f}
+   - Stochastic: {market_data['indicators']['momentum']['stoch']:.2f}
+   - StochRSI: {market_data['indicators']['momentum']['stoch_rsi']:.2f}
+   - MACD: {market_data['indicators']['momentum']['macd']:.2f}
+
+2. Volume Indicators:
+   - Money Flow Index: {market_data['indicators']['volume']['mfi']:.2f}
+   - Accumulation/Distribution Index: {market_data['indicators']['volume']['adi']:.2f}
+   - On-Balance Volume: {market_data['indicators']['volume']['obv']:.2f}
+
+3. Trend Indicators:
+   - ADX: {market_data['indicators']['trend']['adx']:.2f}
+   - CCI: {market_data['indicators']['trend']['cci']:.2f}
+   - DPO: {market_data['indicators']['trend']['dpo']:.2f}
+
+4. Volatility Indicators:
+   - ATR: {market_data['indicators']['volatility']['atr']:.2f}
+   - Bollinger Bands:
+     * Upper: ${market_data['indicators']['volatility']['bb']['upper']:,.2f}
+     * Middle: ${market_data['indicators']['volatility']['bb']['middle']:,.2f}
+     * Lower: ${market_data['indicators']['volatility']['bb']['lower']:,.2f}
+   - Keltner Channels:
+     * High: ${market_data['indicators']['volatility']['kc']['high']:,.2f}
+     * Mid: ${market_data['indicators']['volatility']['kc']['mid']:,.2f}
+     * Low: ${market_data['indicators']['volatility']['kc']['low']:,.2f}
+
+MARKET SENTIMENT:
+1. Fear & Greed Index:
+   - Value: {market_data['sentiment'].get('fear_greed', {}).get('value', 'N/A')}
+   - Classification: {market_data['sentiment'].get('fear_greed', {}).get('classification', 'N/A')}
+
+2. Social Sentiment:
+   - Twitter Sentiment: {market_data['sentiment'].get('social', {}).get('twitter', 'N/A')}
+   - Reddit Sentiment: {market_data['sentiment'].get('social', {}).get('reddit', 'N/A')}
+
+3. Google Trends:
+   - Current Interest: {market_data['sentiment'].get('google_trends', {}).get('current', 'N/A')}
+   - Trend Direction: {market_data['sentiment'].get('google_trends', {}).get('trend', 'N/A')}
+
+PRICE PREDICTIONS:
+- LSTM Model: ${market_data['predictions'].get('lstm', 0):,.2f}
+- ARIMA Model: ${market_data['predictions'].get('arima', 0):,.2f}
+- Ensemble Prediction: ${market_data['predictions'].get('ensemble', 0):,.2f}
+- Prediction Confidence: {market_data['predictions'].get('confidence', 0):.2%}
 
 RECENT MARKET ACTIVITY:
 {news}
 
-Return ONLY a JSON object in this exact format (no other text):
+Based on this comprehensive analysis, provide a detailed JSON response in this exact format:
 {{
     "signal": "STRONG_BUY/BUY/HOLD/SELL/STRONG_SELL",
     "confidence_score": <0.0-1.0>,
@@ -328,12 +486,26 @@ Return ONLY a JSON object in this exact format (no other text):
         "7d": <predicted_price>
     }},
     "risk_level": "LOW/MEDIUM/HIGH",
-    "technical_analysis": "Detailed technical analysis with key points",
+    "technical_analysis": {{
+        "momentum": "Analysis of momentum indicators",
+        "volume": "Analysis of volume indicators",
+        "trend": "Analysis of trend indicators",
+        "volatility": "Analysis of volatility indicators"
+    }},
     "fundamental_analysis": "Analysis of market data and fundamentals",
-    "sentiment_analysis": "Analysis of market activity and sentiment",
+    "sentiment_analysis": {{
+        "market_sentiment": "Analysis of fear & greed index",
+        "social_sentiment": "Analysis of social media sentiment",
+        "trend_analysis": "Analysis of Google Trends data"
+    }},
     "key_takeaways": ["List", "of", "key", "points"],
     "risk_factors": ["List", "of", "potential", "risks"],
-    "recommendation": "Detailed trading recommendation and strategy"
+    "trading_strategy": {{
+        "entry_points": ["List", "of", "entry", "points"],
+        "exit_points": ["List", "of", "exit", "points"],
+        "stop_loss": <stop_loss_price>,
+        "take_profit": <take_profit_price>
+    }}
 }}
 
 IMPORTANT: Return ONLY the JSON object above, with no additional text or formatting."""
@@ -347,7 +519,7 @@ IMPORTANT: Return ONLY the JSON object above, with no additional text or formatt
             analysis_json = json.loads(analysis_text)
             
             return jsonify({
-                'symbol': symbol,
+                'symbol': coin_id,
                 'timestamp': datetime.now().isoformat(),
                 'analysis': analysis_json
             })
